@@ -1,32 +1,11 @@
-import express from 'express';
-import cors from 'cors';
 import { prisma } from './db/prisma';
 import { redis } from './db/redis';
 import { getPublisherChannel } from './db/rabbitmq';
-import bookingRoutes from './routes/bookings';
+import { createApp } from './app';
 
-const app = express();
 const PORT = Number(process.env.PORT) || 3003;
 const INSTANCE_ID = process.env.INSTANCE_ID || 'booking-service';
-
-app.use(cors());
-app.use(express.json());
-
-app.use((_req, res, next) => {
-  res.setHeader('X-Instance-Id', INSTANCE_ID);
-  next();
-});
-
-app.get('/api/bookings/health', (_req, res) => {
-  res.json({ status: 'ok', service: 'booking-service', instance: INSTANCE_ID });
-});
-
-app.get('/health', (_req, res) => {
-  res.json({ status: 'ok', service: 'booking-service', instance: INSTANCE_ID });
-});
-
-app.use('/api/bookings', bookingRoutes);
-app.use('/bookings', bookingRoutes);
+const app = createApp();
 
 async function main(): Promise<void> {
   await prisma.$connect();

@@ -1,7 +1,7 @@
 import { Router, Response } from 'express';
 import { randomUUID } from 'crypto';
 import jwt from 'jsonwebtoken';
-import { BookingStatus } from '@prisma/client';
+import { BookingStatus, Prisma } from '@prisma/client';
 import { prisma } from '../db/prisma';
 import {
   acquireSeatHold,
@@ -11,10 +11,11 @@ import {
   seatLockKey,
   redis,
 } from '../db/redis';
-import { publishBookingConfirmed } from '../db/rabbitmq';
+import {
+  publishBookingConfirmed,
+  BookingConfirmedMessage,
+} from '../db/rabbitmq';
 import { AuthenticatedRequest, requireAuth } from '../middleware/auth';
-
-const router = Router();
 
 interface BookingRow {
   id: string;
@@ -43,6 +44,15 @@ function serializeBooking(b: {
     created_at: b.created_at.toISOString(),
   };
 }
+
+export type BookingConfirmedPublisher = (
+  message: BookingConfirmedMessage
+) => Promise<void>;
+
+export function createBookingRouter(
+  publishConfirmed: BookingConfirmedPublisher = publishBookingConfirmed
+): Router {
+  const router = Router();
 
 /**
  * POST /bookings/reserve
@@ -203,7 +213,7 @@ router.post('/confirm', requireAuth, async (req: AuthenticatedRequest, res: Resp
 
     await releaseSeatHold(booking.event_id, booking.seat_number, hold_token.trim());
 
-    await publishBookingConfirmed({
+    await publishConfirmed({
       booking_id: confirmed.id,
       user_id: confirmed.user_id,
       event_id: confirmed.event_id,
@@ -218,6 +228,13 @@ router.post('/confirm', requireAuth, async (req: AuthenticatedRequest, res: Resp
       message: 'Booking confirmed. Notification queued.',
     });
   } catch (err) {
+    if (
+      err instanceof Prisma.PrismaClientKnownRequestError &&
+      err.code === 'P2002'
+    ) {
+      res.status(409).json({ error: 'seat already booked' });
+      return;
+    }
     if (err && typeof err === 'object' && 'code' in err) {
       const code = (err as { code?: string }).code;
       if (code === 'SEAT_TAKEN') {
@@ -323,4 +340,7 @@ router.get('/events/:eventId/seats', async (req, res: Response) => {
   }
 });
 
-export default router;
+  return router;
+}
+
+export default createBookingRouter();

@@ -205,6 +205,13 @@ services:
       RABBITMQ_EXCHANGE: ${RABBITMQ_EXCHANGE:-booking_events}
       RABBITMQ_ROUTING_KEY: ${RABBITMQ_ROUTING_KEY:-booking.confirmed}
       RABBITMQ_QUEUE: ${RABBITMQ_QUEUE:-booking.confirmed}
+      RABBITMQ_RETRY_EXCHANGE: ${RABBITMQ_RETRY_EXCHANGE:-booking_events.retry}
+      RABBITMQ_RETRY_QUEUE: ${RABBITMQ_RETRY_QUEUE:-booking.confirmed.retry}
+      RABBITMQ_RETRY_DELAY_MS: ${RABBITMQ_RETRY_DELAY_MS:-5000}
+      RABBITMQ_MAX_RETRIES: ${RABBITMQ_MAX_RETRIES:-3}
+      RABBITMQ_DEAD_LETTER_EXCHANGE: ${RABBITMQ_DEAD_LETTER_EXCHANGE:-booking_events.dead}
+      RABBITMQ_DEAD_LETTER_QUEUE: ${RABBITMQ_DEAD_LETTER_QUEUE:-booking.confirmed.dead}
+      RABBITMQ_DEAD_LETTER_KEY: ${RABBITMQ_DEAD_LETTER_KEY:-booking.confirmed.dead}
       TICKETS_DIR: /tickets
     depends_on:
       rabbitmq:
