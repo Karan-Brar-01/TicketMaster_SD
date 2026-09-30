@@ -1,0 +1,258 @@
+services:
+  # ---------------------------------------------------------------------------
+  # Data stores
+  # ---------------------------------------------------------------------------
+  users_db:
+    image: postgres:16-alpine
+    container_name: tm_users_db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${USERS_DB_NAME:-users_db}
+      POSTGRES_USER: ${USERS_DB_USER:-ticketmaster}
+      POSTGRES_PASSWORD: ${USERS_DB_PASSWORD:-ticketmaster}
+    ports:
+      - "5432:5432"
+    volumes:
+      - users_db_data:/var/lib/postgresql/data
+      - ./init-sql/users:/docker-entrypoint-initdb.d:ro
+    networks:
+      - ticketmaster
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${USERS_DB_USER:-ticketmaster} -d ${USERS_DB_NAME:-users_db}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  events_db:
+    image: postgres:16-alpine
+    container_name: tm_events_db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${EVENTS_DB_NAME:-events_db}
+      POSTGRES_USER: ${EVENTS_DB_USER:-ticketmaster}
+      POSTGRES_PASSWORD: ${EVENTS_DB_PASSWORD:-ticketmaster}
+    ports:
+      - "5433:5432"
+    volumes:
+      - events_db_data:/var/lib/postgresql/data
+      - ./init-sql/events:/docker-entrypoint-initdb.d:ro
+    networks:
+      - ticketmaster
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${EVENTS_DB_USER:-ticketmaster} -d ${EVENTS_DB_NAME:-events_db}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  bookings_db:
+    image: postgres:16-alpine
+    container_name: tm_bookings_db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${BOOKINGS_DB_NAME:-bookings_db}
+      POSTGRES_USER: ${BOOKINGS_DB_USER:-ticketmaster}
+      POSTGRES_PASSWORD: ${BOOKINGS_DB_PASSWORD:-ticketmaster}
+    ports:
+      - "5434:5432"
+    volumes:
+      - bookings_db_data:/var/lib/postgresql/data
+      - ./init-sql/bookings:/docker-entrypoint-initdb.d:ro
+    networks:
+      - ticketmaster
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${BOOKINGS_DB_USER:-ticketmaster} -d ${BOOKINGS_DB_NAME:-bookings_db}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    container_name: tm_redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - ticketmaster
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  rabbitmq:
+    image: rabbitmq:3-management-alpine
+    container_name: tm_rabbitmq
+    restart: unless-stopped
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-ticketmaster}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:-ticketmaster}
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    networks:
+      - ticketmaster
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # ---------------------------------------------------------------------------
+  # Application services
+  # ---------------------------------------------------------------------------
+  user-service:
+    build: ./services/user-service
+    container_name: tm_user_service
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      PORT: 3001
+      INSTANCE_ID: user-service
+      JWT_SECRET: ${JWT_SECRET:-change-me-in-production-use-a-long-random-string}
+      JWT_EXPIRES_IN: ${JWT_EXPIRES_IN:-24h}
+      DATABASE_URL: postgres://${USERS_DB_USER:-ticketmaster}:${USERS_DB_PASSWORD:-ticketmaster}@users_db:5432/${USERS_DB_NAME:-users_db}
+    depends_on:
+      users_db:
+        condition: service_healthy
+    networks:
+      - ticketmaster
+    expose:
+      - "3001"
+
+  # Two Event Service replicas behind Nginx event_cluster (round-robin)
+  event-service-1:
+    build: ./services/event-service
+    container_name: tm_event_service_1
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      PORT: 3002
+      INSTANCE_ID: event-service-1
+      JWT_SECRET: ${JWT_SECRET:-change-me-in-production-use-a-long-random-string}
+      DATABASE_URL: postgres://${EVENTS_DB_USER:-ticketmaster}:${EVENTS_DB_PASSWORD:-ticketmaster}@events_db:5432/${EVENTS_DB_NAME:-events_db}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379}
+    depends_on:
+      events_db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - ticketmaster
+    expose:
+      - "3002"
+
+  event-service-2:
+    build: ./services/event-service
+    container_name: tm_event_service_2
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      PORT: 3002
+      INSTANCE_ID: event-service-2
+      JWT_SECRET: ${JWT_SECRET:-change-me-in-production-use-a-long-random-string}
+      DATABASE_URL: postgres://${EVENTS_DB_USER:-ticketmaster}:${EVENTS_DB_PASSWORD:-ticketmaster}@events_db:5432/${EVENTS_DB_NAME:-events_db}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379}
+    depends_on:
+      events_db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - ticketmaster
+    expose:
+      - "3002"
+
+  booking-service:
+    build: ./services/booking-service
+    container_name: tm_booking_service
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      PORT: 3003
+      INSTANCE_ID: booking-service
+      JWT_SECRET: ${JWT_SECRET:-change-me-in-production-use-a-long-random-string}
+      DATABASE_URL: postgres://${BOOKINGS_DB_USER:-ticketmaster}:${BOOKINGS_DB_PASSWORD:-ticketmaster}@bookings_db:5432/${BOOKINGS_DB_NAME:-bookings_db}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379}
+      RABBITMQ_URL: ${RABBITMQ_URL:-amqp://ticketmaster:ticketmaster@rabbitmq:5672}
+      RABBITMQ_EXCHANGE: ${RABBITMQ_EXCHANGE:-booking_events}
+      RABBITMQ_ROUTING_KEY: ${RABBITMQ_ROUTING_KEY:-booking.confirmed}
+      SEAT_HOLD_TTL_SECONDS: ${SEAT_HOLD_TTL_SECONDS:-600}
+    depends_on:
+      bookings_db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    networks:
+      - ticketmaster
+    expose:
+      - "3003"
+
+  notification-service:
+    build: ./services/notification-service
+    container_name: tm_notification_service
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      PORT: 3004
+      INSTANCE_ID: notification-service
+      RABBITMQ_URL: ${RABBITMQ_URL:-amqp://ticketmaster:ticketmaster@rabbitmq:5672}
+      RABBITMQ_EXCHANGE: ${RABBITMQ_EXCHANGE:-booking_events}
+      RABBITMQ_ROUTING_KEY: ${RABBITMQ_ROUTING_KEY:-booking.confirmed}
+      RABBITMQ_QUEUE: ${RABBITMQ_QUEUE:-booking.confirmed}
+      TICKETS_DIR: /tickets
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    volumes:
+      - tickets_data:/tickets
+    networks:
+      - ticketmaster
+    expose:
+      - "3004"
+
+  frontend:
+    build: ./frontend
+    container_name: tm_frontend
+    restart: unless-stopped
+    environment:
+      PORT: 3000
+    networks:
+      - ticketmaster
+    expose:
+      - "3000"
+
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: tm_nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - user-service
+      - event-service-1
+      - event-service-2
+      - booking-service
+      - notification-service
+      - frontend
+    networks:
+      - ticketmaster
+
+networks:
+  ticketmaster:
+    driver: bridge
+
+volumes:
+  users_db_data:
+  events_db_data:
+  bookings_db_data:
+  redis_data:
+  rabbitmq_data:
+  tickets_data:
