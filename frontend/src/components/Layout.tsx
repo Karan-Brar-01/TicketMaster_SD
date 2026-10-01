@@ -13,7 +13,7 @@ export function Layout({ children }: { children: React.ReactNode }) {
               TicketMaster
             </span>
             <span className="hidden text-[10px] uppercase tracking-[0.2em] text-ember-400 sm:inline">
-              SD Lab
+              Tickets
             </span>
           </Link>
           <nav className="flex items-center gap-4 text-sm font-body">
@@ -24,7 +24,15 @@ export function Layout({ children }: { children: React.ReactNode }) {
                 isActive ? 'text-ember-400' : 'text-sand-300 hover:text-sand-50'
               }
             >
-              Events
+              Discover
+            </NavLink>
+            <NavLink
+              to="/lab"
+              className={({ isActive }) =>
+                isActive ? 'text-ember-400' : 'text-sand-300 hover:text-sand-50'
+              }
+            >
+              System Lab
             </NavLink>
             {user ? (
               <>

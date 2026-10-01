@@ -9,6 +9,7 @@ import {
   redis,
 } from '../db/redis';
 import { AuthenticatedRequest, requireAdmin } from '../middleware/auth';
+import { seatLayoutForVenue } from '../seatLayout';
 
 const router = Router();
 
@@ -24,6 +25,7 @@ function serializeEvent(event: {
   created_at: Date;
   updated_at: Date;
 }) {
+  const price = Number(event.price);
   return {
     id: event.id,
     title: event.title,
@@ -31,7 +33,10 @@ function serializeEvent(event: {
     venue: event.venue,
     total_seats: event.total_seats,
     available_seats: event.available_seats,
-    price: Number(event.price),
+    price,
+    vip_price: price * 2,
+    currency: 'INR',
+    seat_layout: seatLayoutForVenue(event.venue),
     date: event.date.toISOString(),
     created_at: event.created_at.toISOString(),
     updated_at: event.updated_at.toISOString(),

@@ -21,3 +21,8 @@ export async function invalidateEventCaches(eventId?: string): Promise<void> {
     await redis.del(...keys);
   }
 }
+
+export async function invalidateAllEventCaches(): Promise<void> {
+  const detailKeys = await redis.keys('events:id:*');
+  await redis.del(EVENTS_LIST_CACHE_KEY, ...detailKeys);
+}

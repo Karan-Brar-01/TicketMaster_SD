@@ -181,6 +181,7 @@ services:
       RABBITMQ_EXCHANGE: ${RABBITMQ_EXCHANGE:-booking_events}
       RABBITMQ_ROUTING_KEY: ${RABBITMQ_ROUTING_KEY:-booking.confirmed}
       SEAT_HOLD_TTL_SECONDS: ${SEAT_HOLD_TTL_SECONDS:-600}
+      EVENT_SERVICE_URL: http://event-service-1:3002/api/events
     depends_on:
       bookings_db:
         condition: service_healthy
@@ -188,6 +189,8 @@ services:
         condition: service_healthy
       rabbitmq:
         condition: service_healthy
+      event-service-1:
+        condition: service_started
     networks:
       - ticketmaster
     expose:

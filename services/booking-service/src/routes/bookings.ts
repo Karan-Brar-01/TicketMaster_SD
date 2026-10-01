@@ -16,6 +16,12 @@ import {
   BookingConfirmedMessage,
 } from '../db/rabbitmq';
 import { AuthenticatedRequest, requireAuth } from '../middleware/auth';
+import {
+  EventCatalogError,
+  EventCatalogReader,
+  EventSeatConfig,
+  getEventSeatConfig,
+} from '../services/eventCatalog';
 
 interface BookingRow {
   id: string;
@@ -50,7 +56,8 @@ export type BookingConfirmedPublisher = (
 ) => Promise<void>;
 
 export function createBookingRouter(
-  publishConfirmed: BookingConfirmedPublisher = publishBookingConfirmed
+  publishConfirmed: BookingConfirmedPublisher = publishBookingConfirmed,
+  readEvent: EventCatalogReader = getEventSeatConfig
 ): Router {
   const router = Router();
 
@@ -72,6 +79,17 @@ router.post('/reserve', requireAuth, async (req: AuthenticatedRequest, res: Resp
 
     if (seat_number < 1) {
       res.status(400).json({ error: 'seat_number must be >= 1' });
+      return;
+    }
+
+    const event = await readEvent(event_id.trim());
+    if (seat_number > event.total_seats) {
+      res.status(400).json({ error: 'seat_number is outside this theatre' });
+      return;
+    }
+    const seat = describeSeat(event, seat_number);
+    if (seat.status === 'blocked') {
+      res.status(409).json({ error: 'seat row is unavailable' });
       return;
     }
 
@@ -121,6 +139,7 @@ router.post('/reserve', requireAuth, async (req: AuthenticatedRequest, res: Resp
 
       res.status(201).json({
         booking: serializeBooking(booking),
+        seat,
         hold_token: holdToken,
         hold_ttl_seconds: SEAT_HOLD_TTL_SECONDS,
         message: 'Seat held for 10 minutes. Confirm before the hold expires.',
@@ -130,6 +149,10 @@ router.post('/reserve', requireAuth, async (req: AuthenticatedRequest, res: Resp
       throw err;
     }
   } catch (err) {
+    if (err instanceof EventCatalogError) {
+      res.status(err.status).json({ error: err.message });
+      return;
+    }
     console.error('[POST /bookings/reserve]', err);
     res.status(500).json({ error: 'failed to reserve seat' });
   }
@@ -265,17 +288,18 @@ router.get('/mine', requireAuth, async (req: AuthenticatedRequest, res: Response
 });
 
 /**
- * GET /bookings/events/:eventId/seats?total=N
- * Live seat map: available | held | booked
+ * GET /bookings/events/:eventId/seats
+ * Live seat map: available | held | booked | blocked, with server-owned pricing.
  */
 router.get('/events/:eventId/seats', async (req, res: Response) => {
   try {
     const eventId = req.params.eventId;
-    const total = Number(req.query.total);
-    if (!eventId || !Number.isInteger(total) || total < 1 || total > 2000) {
-      res.status(400).json({ error: 'eventId and total (1–2000) are required' });
+    if (!eventId) {
+      res.status(400).json({ error: 'eventId is required' });
       return;
     }
+    const event = await readEvent(eventId);
+    const total = event.total_seats;
 
     const confirmed = await prisma.booking.findMany({
       where: { event_id: eventId, status: BookingStatus.confirmed },
@@ -315,8 +339,11 @@ router.get('/events/:eventId/seats', async (req, res: Response) => {
 
     const seats = Array.from({ length: total }, (_, i) => {
       const seat_number = i + 1;
+      const details = describeSeat(event, seat_number);
+      if (details.status === 'blocked') return details;
       if (confirmedMap.has(seat_number)) {
         return {
+          ...details,
           seat_number,
           status: 'booked' as const,
           mine: userId != null && confirmedMap.get(seat_number) === userId,
@@ -324,23 +351,51 @@ router.get('/events/:eventId/seats', async (req, res: Response) => {
       }
       if (holdTokens[i]) {
         return {
+          ...details,
           seat_number,
           status: 'held' as const,
           mine: myHeldSeats.has(seat_number),
           booking_id: myHeldSeats.get(seat_number),
         };
       }
-      return { seat_number, status: 'available' as const, mine: false };
+      return { ...details, status: 'available' as const, mine: false };
     });
 
-    res.json({ event_id: eventId, total, seats });
+    res.json({
+      event_id: eventId,
+      total,
+      currency: event.currency,
+      seat_layout: event.seat_layout,
+      seats,
+    });
   } catch (err) {
+    if (err instanceof EventCatalogError) {
+      res.status(err.status).json({ error: err.message });
+      return;
+    }
     console.error('[GET /bookings/events/:eventId/seats]', err);
     res.status(500).json({ error: 'failed to load seats' });
   }
 });
 
   return router;
+}
+
+function describeSeat(event: EventSeatConfig, seatNumber: number) {
+  const rowNumber = Math.floor((seatNumber - 1) / event.seat_layout.columns) + 1;
+  const seatInRow = ((seatNumber - 1) % event.seat_layout.columns) + 1;
+  const vip = event.seat_layout.vip_rows.includes(rowNumber);
+  const blocked = event.seat_layout.blocked_rows.includes(rowNumber);
+  return {
+    seat_number: seatNumber,
+    row_number: rowNumber,
+    row_label: String.fromCharCode(64 + rowNumber),
+    seat_in_row: seatInRow,
+    seat_type: vip ? ('vip' as const) : ('standard' as const),
+    price: vip ? event.vip_price : event.price,
+    currency: event.currency,
+    status: blocked ? ('blocked' as const) : ('available' as const),
+  };
 }
 
 export default createBookingRouter();

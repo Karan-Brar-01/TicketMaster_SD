@@ -10,6 +10,7 @@ import {
   releaseSeatHold,
   seatLockKey,
 } from '../src/db/redis';
+import type { EventCatalogReader } from '../src/services/eventCatalog';
 
 const jwtSecret = process.env.JWT_SECRET!;
 
@@ -22,7 +23,24 @@ function auth(userId: string): string {
 
 describe('booking concurrency and ownership invariants', () => {
   const publish = vi.fn(async () => undefined);
-  const app = createApp({ publishBookingConfirmed: publish });
+  const getEventSeatConfig: EventCatalogReader = vi.fn(async (eventId) => ({
+    id: eventId,
+    total_seats: 100,
+    price: 500,
+    vip_price: 1000,
+    currency: 'INR',
+    seat_layout: {
+      name: 'Test Theatre',
+      columns: 10,
+      vip_rows: [1, 2],
+      blocked_rows: [6],
+      aisle_after_columns: [5],
+    },
+  }));
+  const app = createApp({
+    publishBookingConfirmed: publish,
+    getEventSeatConfig,
+  });
 
   beforeEach(async () => {
     publish.mockClear();
@@ -43,6 +61,34 @@ describe('booking concurrency and ownership invariants', () => {
       .send({ event_id: 'E1', seat_number: 0 });
 
     expect(response.status).toBe(400);
+  });
+
+  it('rejects reservations in the theatre blocked row', async () => {
+    const response = await request(app)
+      .post('/api/bookings/reserve')
+      .set('Authorization', auth('user-1'))
+      .send({ event_id: 'E1', seat_number: 51 });
+
+    expect(response.status).toBe(409);
+    expect(response.body.error).toBe('seat row is unavailable');
+    expect(await prisma.booking.count()).toBe(0);
+  });
+
+  it('returns backend-owned row, tier, price, and blocked-seat metadata', async () => {
+    const response = await request(app).get('/api/bookings/events/E1/seats');
+
+    expect(response.status).toBe(200);
+    expect(response.body.currency).toBe('INR');
+    expect(response.body.seats[0]).toMatchObject({
+      row_label: 'A',
+      seat_type: 'vip',
+      price: 1000,
+      status: 'available',
+    });
+    expect(response.body.seats[50]).toMatchObject({
+      row_label: 'F',
+      status: 'blocked',
+    });
   });
 
   it('allows exactly one of 20 users to hold the same seat', async () => {

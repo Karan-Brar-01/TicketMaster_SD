@@ -4,9 +4,11 @@ import {
   BookingConfirmedPublisher,
   createBookingRouter,
 } from './routes/bookings';
+import { EventCatalogReader } from './services/eventCatalog';
 
 export interface AppDependencies {
   publishBookingConfirmed?: BookingConfirmedPublisher;
+  getEventSeatConfig?: EventCatalogReader;
 }
 
 export function createApp(dependencies: AppDependencies = {}): Express {
@@ -30,7 +32,8 @@ export function createApp(dependencies: AppDependencies = {}): Express {
   });
 
   const bookingRouter = createBookingRouter(
-    dependencies.publishBookingConfirmed
+    dependencies.publishBookingConfirmed,
+    dependencies.getEventSeatConfig
   );
   app.use('/api/bookings', bookingRouter);
   app.use('/bookings', bookingRouter);

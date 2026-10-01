@@ -1,37 +1,69 @@
 import { useState } from 'react';
+import { Link } from 'react-router-dom';
 import { apiFetch } from '../api/client';
+import { useAuth } from '../context/AuthContext';
 import { useTraffic } from '../context/TrafficContext';
 import type { TrafficHit } from '../types';
 
-export function SystemDashboard() {
-  const { lastHit, counts, clear, recordHits } = useTraffic();
-  const [open, setOpen] = useState(true);
-  const [spamming, setSpamming] = useState(false);
-  const [spamSummary, setSpamSummary] = useState<string | null>(null);
-  const [doubleBookTest, setDoubleBookTest] = useState<string | null>(null);
+interface ProbeResult {
+  cache: string;
+  servedBy: string;
+  ms: number;
+}
 
-  const entries = Object.entries(counts).sort((a, b) => b[1] - a[1]);
-  const max = Math.max(1, ...entries.map(([, n]) => n));
+export function SystemDashboard() {
+  const { user } = useAuth();
+  const { lastHit, recent, clear, recordHits } = useTraffic();
+  const [running, setRunning] = useState<'traffic' | 'seat' | 'cache' | null>(null);
+  const [trafficSummary, setTrafficSummary] = useState<string | null>(null);
+  const [seatSummary, setSeatSummary] = useState<string | null>(null);
+  const [cacheResults, setCacheResults] = useState<ProbeResult[]>([]);
+
+  const eventCounts = recent.reduce<Record<string, number>>((totals, hit) => {
+    if (hit.path === '/api/events') {
+      totals[hit.servedBy] = (totals[hit.servedBy] || 0) + 1;
+    }
+    return totals;
+  }, {});
+  const entries = Object.entries(eventCounts).sort((a, b) => b[1] - a[1]);
+  const max = Math.max(1, ...entries.map(([, count]) => count));
+
+  async function probeCache() {
+    setRunning('cache');
+    setCacheResults([]);
+    try {
+      const results: ProbeResult[] = [];
+      for (let index = 0; index < 3; index += 1) {
+        const result = await apiFetch('/api/events');
+        results.push({
+          cache: result.cache ?? '—',
+          servedBy: result.servedBy,
+          ms: result.ms,
+        });
+      }
+      setCacheResults(results);
+    } finally {
+      setRunning(null);
+    }
+  }
 
   async function spamEvents() {
-    setSpamming(true);
-    setSpamSummary(null);
+    setRunning('traffic');
+    setTrafficSummary(null);
     try {
       const results = await Promise.all(
         Array.from({ length: 50 }, async () => {
           const started = performance.now();
           try {
-            const res = await fetch('/api/events', {
+            const response = await fetch('/api/events', {
               headers: { 'Content-Type': 'application/json' },
             });
-            const ms = Math.round(performance.now() - started);
-            const servedBy = res.headers.get('X-Served-By') || 'unknown';
             return {
-              servedBy,
-              ms,
+              servedBy: response.headers.get('X-Served-By') || 'unknown',
+              ms: Math.round(performance.now() - started),
               path: '/api/events',
               at: Date.now(),
-              ok: res.ok,
+              ok: response.ok,
             } satisfies TrafficHit;
           } catch {
             return {
@@ -45,43 +77,56 @@ export function SystemDashboard() {
         })
       );
       recordHits(results);
-      const dist: Record<string, number> = {};
-      for (const r of results) {
-        dist[r.servedBy] = (dist[r.servedBy] || 0) + 1;
+      const distribution: Record<string, number> = {};
+      for (const result of results) {
+        distribution[result.servedBy] =
+          (distribution[result.servedBy] || 0) + 1;
       }
-      const parts = Object.entries(dist)
-        .map(([k, v]) => `${k} → ${v}`)
-        .join(' · ');
-      setSpamSummary(`50 GETs done. Distribution: ${parts}`);
+      setTrafficSummary(
+        Object.entries(distribution)
+          .map(([host, count]) => `${host}: ${count}`)
+          .join(' · ')
+      );
     } finally {
-      setSpamming(false);
+      setRunning(null);
     }
   }
 
   async function spamSameSeat() {
-    setSpamming(true);
-    setDoubleBookTest(null);
+    setRunning('seat');
+    setSeatSummary(null);
     try {
       const token = localStorage.getItem('tm_token');
       if (!token) {
-        setDoubleBookTest('Sign in first to run the double-booking stress test.');
+        setSeatSummary('Sign in first to run the same-seat contention test.');
         return;
       }
 
-      const { data: eventsData } = await apiFetch<{
+      const { data } = await apiFetch<{
         events: { id: string; total_seats: number }[];
       }>('/api/events');
-      const first = eventsData.events[0];
+      const first = data.events[0];
       if (!first) {
-        setDoubleBookTest('No events available.');
+        setSeatSummary('No events are available.');
         return;
       }
 
-      const seat = Math.min(first.total_seats, 50);
+      const { data: seatData } = await apiFetch<{
+        seats: { seat_number: number; status: string; seat_type: string }[];
+      }>(`/api/bookings/events/${first.id}/seats`);
+      const targetSeat =
+        seatData.seats.find(
+          (seat) => seat.status === 'available' && seat.seat_type === 'standard'
+        ) ?? seatData.seats.find((seat) => seat.status === 'available');
+      if (!targetSeat) {
+        setSeatSummary('No reservable seat is available for the contention test.');
+        return;
+      }
+      const seat = targetSeat.seat_number;
       const results = await Promise.all(
         Array.from({ length: 50 }, async () => {
           const started = performance.now();
-          const res = await fetch('/api/bookings/reserve', {
+          const response = await fetch('/api/bookings/reserve', {
             method: 'POST',
             headers: {
               'Content-Type': 'application/json',
@@ -89,132 +134,181 @@ export function SystemDashboard() {
             },
             body: JSON.stringify({ event_id: first.id, seat_number: seat }),
           });
-          const ms = Math.round(performance.now() - started);
-          const servedBy = res.headers.get('X-Served-By') || 'unknown';
           return {
-            status: res.status,
+            status: response.status,
             hit: {
-              servedBy,
-              ms,
+              servedBy: response.headers.get('X-Served-By') || 'unknown',
+              ms: Math.round(performance.now() - started),
               path: '/api/bookings/reserve',
               at: Date.now(),
-              ok: res.ok,
+              ok: response.ok,
             } satisfies TrafficHit,
           };
         })
       );
 
-      recordHits(results.map((r) => r.hit));
-      const wins = results.filter((r) => r.status === 201).length;
-      const conflicts = results.filter((r) => r.status === 409).length;
-      setDoubleBookTest(
+      recordHits(results.map((result) => result.hit));
+      const wins = results.filter((result) => result.status === 201).length;
+      const conflicts = results.filter((result) => result.status === 409).length;
+      setSeatSummary(
         wins === 1
-          ? `Seat ${seat}: exactly 1 hold won, ${conflicts} rejected (409). Zero double-bookings.`
-          : `Seat ${seat}: unexpected — ${wins} successes, ${conflicts} conflicts.`
+          ? `Verified: exactly 1 hold won for seat ${seat}; ${conflicts} requests were rejected with 409.`
+          : `Unexpected result: ${wins} successful holds and ${conflicts} conflicts for seat ${seat}.`
       );
     } catch (err) {
-      setDoubleBookTest(err instanceof Error ? err.message : 'Stress test failed');
+      setSeatSummary(err instanceof Error ? err.message : 'Contention test failed.');
     } finally {
-      setSpamming(false);
+      setRunning(null);
     }
   }
 
   return (
-    <aside
-      className={`fixed bottom-4 right-4 z-40 w-[min(100%-2rem,22rem)] font-body transition-all ${
-        open ? '' : 'translate-y-[calc(100%-2.75rem)]'
-      }`}
-    >
-      <div className="overflow-hidden rounded-xl border border-white/15 bg-ink-900/95 shadow-glow backdrop-blur-lg">
+    <div className="grid gap-6 lg:grid-cols-2">
+      <LabCard eyebrow="Nginx round-robin" title="Replica traffic">
+        <p className="text-sm leading-relaxed text-sand-300">
+          Fire 50 simultaneous catalog requests and inspect how Nginx distributes
+          them across the two event-service replicas.
+        </p>
         <button
           type="button"
-          onClick={() => setOpen((v) => !v)}
-          className="flex w-full items-center justify-between px-4 py-3 text-left"
+          disabled={running != null}
+          onClick={() => void spamEvents()}
+          className="mt-5 rounded-lg bg-ember-500 px-4 py-2.5 text-sm font-semibold text-ink-950 hover:bg-ember-400 disabled:opacity-50"
         >
-          <span className="font-display text-sm font-bold tracking-wide text-sand-50">
-            System Design
-          </span>
-          <span className="font-mono text-[10px] uppercase tracking-widest text-ember-400">
-            {open ? 'collapse' : 'expand'}
-          </span>
+          {running === 'traffic' ? 'Sending 50 requests…' : 'Run load-balancing test'}
         </button>
-
-        <div className="space-y-4 border-t border-white/10 px-4 pb-4 pt-3">
-          <div>
-            <p className="text-[10px] uppercase tracking-[0.18em] text-sand-300">
-              Last upstream
-            </p>
-            <p className="mt-1 break-all font-mono text-sm text-ember-400">
-              {lastHit?.servedBy ?? '—'}
-            </p>
-            {lastHit && (
-              <p className="mt-1 font-mono text-[11px] text-sand-300">
-                {lastHit.path} · {lastHit.ms}ms ·{' '}
-                {lastHit.ok ? 'ok' : 'error'}
-              </p>
-            )}
-          </div>
-
-          {entries.length > 0 && (
-            <div className="space-y-2">
-              <p className="text-[10px] uppercase tracking-[0.18em] text-sand-300">
-                Replica traffic
-              </p>
-              {entries.map(([host, n]) => (
-                <div key={host} className="space-y-1">
-                  <div className="flex justify-between font-mono text-[11px]">
-                    <span className="truncate text-sand-100">{host}</span>
-                    <span className="text-ember-400">{n}</span>
-                  </div>
-                  <div className="h-1.5 overflow-hidden rounded-full bg-ink-800">
-                    <div
-                      className="h-full origin-left animate-barGrow rounded-full bg-ember-500"
-                      style={{ width: `${(n / max) * 100}%` }}
-                    />
-                  </div>
+        {trafficSummary && <Result>{trafficSummary}</Result>}
+        <div className="mt-5 space-y-3">
+          {entries.length === 0 ? (
+            <p className="text-xs text-sand-300">No recorded traffic yet.</p>
+          ) : (
+            entries.map(([host, count]) => (
+              <div key={host}>
+                <div className="flex justify-between font-mono text-xs">
+                  <span className="truncate text-sand-100">{host}</span>
+                  <span className="text-ember-400">{count}</span>
                 </div>
-              ))}
+                <div className="mt-1.5 h-2 overflow-hidden rounded-full bg-ink-800">
+                  <div
+                    className="h-full rounded-full bg-ember-500 transition-all"
+                    style={{ width: `${(count / max) * 100}%` }}
+                  />
+                </div>
+              </div>
+            ))
+          )}
+        </div>
+      </LabCard>
+
+      <LabCard eyebrow="Redis read-through" title="Cache behavior">
+        <p className="text-sm leading-relaxed text-sand-300">
+          Request the event catalog three times and compare the response cache
+          header, upstream replica, and latency.
+        </p>
+        <button
+          type="button"
+          disabled={running != null}
+          onClick={() => void probeCache()}
+          className="mt-5 rounded-lg border border-white/20 px-4 py-2.5 text-sm font-semibold text-sand-50 hover:border-ember-400/60 disabled:opacity-50"
+        >
+          {running === 'cache' ? 'Probing cache…' : 'Run cache probe'}
+        </button>
+        <div className="mt-5 space-y-2">
+          {cacheResults.map((result, index) => (
+            <div
+              key={`${result.servedBy}-${index}`}
+              className="grid grid-cols-[3rem_4rem_1fr_auto] gap-2 rounded-lg border border-white/10 bg-ink-950/45 px-3 py-2 font-mono text-xs"
+            >
+              <span className="text-sand-300">#{index + 1}</span>
+              <span className={result.cache === 'HIT' ? 'text-emerald-300' : 'text-ember-400'}>
+                {result.cache}
+              </span>
+              <span className="truncate text-sand-100">{result.servedBy}</span>
+              <span className="text-sand-300">{result.ms}ms</span>
             </div>
-          )}
+          ))}
+        </div>
+      </LabCard>
 
-          <div className="flex flex-col gap-2">
-            <button
-              type="button"
-              disabled={spamming}
-              onClick={() => void spamEvents()}
-              className="rounded-lg bg-ember-500 px-3 py-2 text-sm font-medium text-ink-950 hover:bg-ember-400 disabled:opacity-60"
-            >
-              {spamming ? 'Running…' : 'Spam 50 Concurrent Requests'}
-            </button>
-            <button
-              type="button"
-              disabled={spamming}
-              onClick={() => void spamSameSeat()}
-              className="rounded-lg border border-white/20 px-3 py-2 text-sm text-sand-100 hover:border-ember-400/60 disabled:opacity-60"
-            >
-              Stress: 50× same seat
-            </button>
-            <button
-              type="button"
-              onClick={clear}
-              className="text-left text-[11px] text-sand-300 underline-offset-2 hover:underline"
-            >
-              Clear counters
-            </button>
-          </div>
+      <LabCard eyebrow="Redis SET NX" title="Same-seat contention">
+        <p className="text-sm leading-relaxed text-sand-300">
+          Race 50 authenticated requests for one seat. A correct run produces one
+          temporary hold and rejects the rest as conflicts.
+        </p>
+        {user ? (
+          <button
+            type="button"
+            disabled={running != null}
+            onClick={() => void spamSameSeat()}
+            className="mt-5 rounded-lg bg-ember-500 px-4 py-2.5 text-sm font-semibold text-ink-950 hover:bg-ember-400 disabled:opacity-50"
+          >
+            {running === 'seat' ? 'Racing 50 reservations…' : 'Run contention test'}
+          </button>
+        ) : (
+          <Link
+            to="/login"
+            state={{ from: '/lab' }}
+            className="mt-5 inline-block rounded-lg bg-ember-500 px-4 py-2.5 text-sm font-semibold text-ink-950 hover:bg-ember-400"
+          >
+            Sign in to run test
+          </Link>
+        )}
+        {seatSummary && <Result>{seatSummary}</Result>}
+      </LabCard>
 
-          {spamSummary && (
-            <p className="font-mono text-[11px] leading-relaxed text-sand-100">
-              {spamSummary}
-            </p>
-          )}
-          {doubleBookTest && (
-            <p className="font-mono text-[11px] leading-relaxed text-ember-400">
-              {doubleBookTest}
+      <LabCard eyebrow="Request telemetry" title="Latest API activity">
+        <div className="rounded-xl border border-white/10 bg-ink-950/45 p-4">
+          <p className="text-[10px] uppercase tracking-widest text-sand-300">Last upstream</p>
+          <p className="mt-1 break-all font-mono text-base text-ember-400">
+            {lastHit?.servedBy ?? 'No requests recorded'}
+          </p>
+          {lastHit && (
+            <p className="mt-1 font-mono text-xs text-sand-300">
+              {lastHit.path} · {lastHit.ms}ms · {lastHit.ok ? 'ok' : 'error'}
             </p>
           )}
         </div>
-      </div>
-    </aside>
+        <div className="mt-3 max-h-36 space-y-1 overflow-auto font-mono text-[11px] text-sand-300">
+          {recent.slice(0, 8).map((hit, index) => (
+            <p key={`${hit.at}-${index}`}>
+              {hit.ok ? '200' : 'ERR'} · {hit.ms}ms · {hit.path} · {hit.servedBy}
+            </p>
+          ))}
+        </div>
+        <button
+          type="button"
+          onClick={clear}
+          className="mt-4 text-xs text-sand-300 underline-offset-2 hover:text-sand-50 hover:underline"
+        >
+          Clear telemetry
+        </button>
+      </LabCard>
+    </div>
+  );
+}
+
+function LabCard({
+  eyebrow,
+  title,
+  children,
+}: {
+  eyebrow: string;
+  title: string;
+  children: React.ReactNode;
+}) {
+  return (
+    <section className="rounded-2xl border border-white/10 bg-ink-900/55 p-5 sm:p-6">
+      <p className="font-mono text-[10px] uppercase tracking-[0.2em] text-ember-400">{eyebrow}</p>
+      <h2 className="mt-1 font-display text-xl font-bold text-sand-50">{title}</h2>
+      <div className="mt-3">{children}</div>
+    </section>
+  );
+}
+
+function Result({ children }: { children: React.ReactNode }) {
+  return (
+    <p className="mt-4 rounded-lg border border-ember-400/20 bg-ember-500/10 px-3 py-2 font-mono text-xs leading-relaxed text-ember-300">
+      {children}
+    </p>
   );
 }
