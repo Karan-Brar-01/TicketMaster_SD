@@ -3,12 +3,14 @@ import cors from 'cors';
 import {
   BookingConfirmedPublisher,
   createBookingRouter,
+  HeldBookingGroupCreator,
 } from './routes/bookings';
 import { EventCatalogReader } from './services/eventCatalog';
 
 export interface AppDependencies {
   publishBookingConfirmed?: BookingConfirmedPublisher;
   getEventSeatConfig?: EventCatalogReader;
+  createHeldBookingGroup?: HeldBookingGroupCreator;
 }
 
 export function createApp(dependencies: AppDependencies = {}): Express {
@@ -33,7 +35,8 @@ export function createApp(dependencies: AppDependencies = {}): Express {
 
   const bookingRouter = createBookingRouter(
     dependencies.publishBookingConfirmed,
-    dependencies.getEventSeatConfig
+    dependencies.getEventSeatConfig,
+    dependencies.createHeldBookingGroup
   );
   app.use('/api/bookings', bookingRouter);
   app.use('/bookings', bookingRouter);

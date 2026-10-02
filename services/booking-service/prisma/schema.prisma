@@ -15,15 +15,17 @@ enum BookingStatus {
 }
 
 model Booking {
-  id          String        @id @default(uuid())
-  user_id     String
-  event_id    String
-  seat_number Int
-  status      BookingStatus @default(held)
-  created_at  DateTime      @default(now())
-  updated_at  DateTime      @updatedAt
+  id             String        @id @default(uuid())
+  reservation_id String?
+  user_id        String
+  event_id       String
+  seat_number    Int
+  status         BookingStatus @default(held)
+  created_at     DateTime      @default(now())
+  updated_at     DateTime      @updatedAt
 
   @@index([event_id, seat_number])
+  @@index([reservation_id])
   @@index([user_id])
   @@map("bookings")
 }

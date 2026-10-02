@@ -91,6 +91,184 @@ describe('booking concurrency and ownership invariants', () => {
     });
   });
 
+  it('atomically reserves three available seats with backend-owned pricing', async () => {
+    const response = await request(app)
+      .post('/api/bookings/reserve')
+      .set('Authorization', auth('group-owner'))
+      .send({ event_id: 'E1', seat_numbers: [42, 43, 44] });
+
+    expect(response.status).toBe(201);
+    expect(response.body.reservation).toMatchObject({
+      event_id: 'E1',
+      status: 'held',
+      seat_numbers: [42, 43, 44],
+      total_price: 1500,
+      currency: 'INR',
+    });
+    expect(response.body.bookings).toHaveLength(3);
+    expect(response.body.seats.map((seat: { price: number }) => seat.price)).toEqual([
+      500, 500, 500,
+    ]);
+
+    const tokens = await redis.mget(
+      seatLockKey('E1', 42),
+      seatLockKey('E1', 43),
+      seatLockKey('E1', 44)
+    );
+    expect(tokens).toEqual([
+      response.body.hold_token,
+      response.body.hold_token,
+      response.body.hold_token,
+    ]);
+    expect(
+      await prisma.booking.count({
+        where: {
+          reservation_id: response.body.reservation.id,
+          status: BookingStatus.held,
+        },
+      })
+    ).toBe(3);
+  });
+
+  it('rejects a duplicate seat inside one group', async () => {
+    const response = await request(app)
+      .post('/api/bookings/reserve')
+      .set('Authorization', auth('group-owner'))
+      .send({ event_id: 'E1', seat_numbers: [42, 42, 43] });
+
+    expect(response.status).toBe(400);
+    expect(response.body.error).toBe('duplicate seat numbers are not allowed');
+    expect(await prisma.booking.count()).toBe(0);
+    expect(await redis.dbsize()).toBe(0);
+  });
+
+  it('rejects blocked and out-of-range seats before acquiring any group lock', async () => {
+    const blocked = await request(app)
+      .post('/api/bookings/reserve')
+      .set('Authorization', auth('group-owner'))
+      .send({ event_id: 'E1', seat_numbers: [42, 51, 43] });
+    const outOfRange = await request(app)
+      .post('/api/bookings/reserve')
+      .set('Authorization', auth('group-owner'))
+      .send({ event_id: 'E1', seat_numbers: [42, 101, 43] });
+
+    expect(blocked.status).toBe(409);
+    expect(blocked.body.seat_number).toBe(51);
+    expect(outOfRange.status).toBe(400);
+    expect(await prisma.booking.count()).toBe(0);
+    expect(await redis.dbsize()).toBe(0);
+  });
+
+  it('leaves no partial locks or held rows when one requested seat is unavailable', async () => {
+    await redis.set(seatLockKey('E1', 43), 'existing-owner', 'EX', 60);
+
+    const response = await request(app)
+      .post('/api/bookings/reserve')
+      .set('Authorization', auth('group-owner'))
+      .send({ event_id: 'E1', seat_numbers: [42, 43, 44] });
+
+    expect(response.status).toBe(409);
+    expect(await getSeatHoldToken('E1', 42)).toBeNull();
+    expect(await getSeatHoldToken('E1', 43)).toBe('existing-owner');
+    expect(await getSeatHoldToken('E1', 44)).toBeNull();
+    expect(await prisma.booking.count({ where: { status: BookingStatus.held } })).toBe(0);
+  });
+
+  it('rejects an entire group when one seat is already confirmed', async () => {
+    await prisma.booking.create({
+      data: {
+        user_id: 'first-owner',
+        event_id: 'E1',
+        seat_number: 43,
+        status: BookingStatus.confirmed,
+      },
+    });
+
+    const response = await request(app)
+      .post('/api/bookings/reserve')
+      .set('Authorization', auth('group-owner'))
+      .send({ event_id: 'E1', seat_numbers: [42, 43, 44] });
+
+    expect(response.status).toBe(409);
+    expect(response.body.unavailable_seat_number).toBe(43);
+    expect(
+      await redis.mget(
+        seatLockKey('E1', 42),
+        seatLockKey('E1', 43),
+        seatLockKey('E1', 44)
+      )
+    ).toEqual([null, null, null]);
+    expect(await prisma.booking.count({ where: { status: BookingStatus.held } })).toBe(0);
+  });
+
+  it('allows exactly one winner for overlapping concurrent seat groups', async () => {
+    const groups = [
+      { user: 'group-a', seats: [42, 43, 44] },
+      { user: 'group-b', seats: [44, 45, 46] },
+    ];
+    const responses = await Promise.all(
+      groups.map((group) =>
+        request(app)
+          .post('/api/bookings/reserve')
+          .set('Authorization', auth(group.user))
+          .send({ event_id: 'E1', seat_numbers: group.seats })
+      )
+    );
+
+    expect(responses.filter((response) => response.status === 201)).toHaveLength(1);
+    expect(responses.filter((response) => response.status === 409)).toHaveLength(1);
+    const winnerIndex = responses.findIndex((response) => response.status === 201);
+    const loserIndex = winnerIndex === 0 ? 1 : 0;
+    const winner = responses[winnerIndex];
+    const winnerSeats = groups[winnerIndex].seats;
+    const losingOnlySeats = groups[loserIndex].seats.filter(
+      (seat) => !winnerSeats.includes(seat)
+    );
+
+    expect(
+      await redis.mget(...winnerSeats.map((seat) => seatLockKey('E1', seat)))
+    ).toEqual(winnerSeats.map(() => winner.body.hold_token));
+    expect(
+      await redis.mget(...losingOnlySeats.map((seat) => seatLockKey('E1', seat)))
+    ).toEqual(losingOnlySeats.map(() => null));
+    expect(await prisma.booking.count({ where: { status: BookingStatus.held } })).toBe(3);
+  });
+
+  it('releases every newly acquired lock when the database transaction fails', async () => {
+    const failingApp = createApp({
+      publishBookingConfirmed: publish,
+      getEventSeatConfig,
+      createHeldBookingGroup: ({ reservationId, userId, eventId, seatNumbers }) =>
+        prisma.$transaction(async (tx) => {
+          await tx.booking.create({
+            data: {
+              reservation_id: reservationId,
+              user_id: userId,
+              event_id: eventId,
+              seat_number: seatNumbers[0],
+              status: BookingStatus.held,
+            },
+          });
+          throw new Error('forced database failure after first insert');
+        }),
+    });
+
+    const response = await request(failingApp)
+      .post('/api/bookings/reserve')
+      .set('Authorization', auth('group-owner'))
+      .send({ event_id: 'E1', seat_numbers: [42, 43, 44] });
+
+    expect(response.status).toBe(500);
+    expect(
+      await redis.mget(
+        seatLockKey('E1', 42),
+        seatLockKey('E1', 43),
+        seatLockKey('E1', 44)
+      )
+    ).toEqual([null, null, null]);
+    expect(await prisma.booking.count()).toBe(0);
+  });
+
   it('allows exactly one of 20 users to hold the same seat', async () => {
     const responses = await Promise.all(
       Array.from({ length: 20 }, (_, index) =>
@@ -216,6 +394,72 @@ describe('booking concurrency and ownership invariants', () => {
     expect(second.status).toBe(200);
     expect(second.body.message).toBe('already confirmed');
     expect(publish).toHaveBeenCalledTimes(1);
+  });
+
+  it('confirms every seat in a reservation group in one operation', async () => {
+    const reservation = await request(app)
+      .post('/api/bookings/reserve')
+      .set('Authorization', auth('group-owner'))
+      .send({ event_id: 'E1', seat_numbers: [42, 43, 44] });
+
+    const response = await request(app)
+      .post('/api/bookings/confirm')
+      .set('Authorization', auth('group-owner'))
+      .send({
+        reservation_id: reservation.body.reservation.id,
+        hold_token: reservation.body.hold_token,
+      });
+
+    expect(response.status).toBe(200);
+    expect(response.body.reservation).toMatchObject({
+      id: reservation.body.reservation.id,
+      status: 'confirmed',
+      seat_numbers: [42, 43, 44],
+    });
+    expect(response.body.bookings).toHaveLength(3);
+    expect(response.body.bookings.every((booking: { status: string }) => booking.status === 'confirmed')).toBe(true);
+    expect(
+      await prisma.booking.count({
+        where: {
+          reservation_id: reservation.body.reservation.id,
+          status: BookingStatus.confirmed,
+        },
+      })
+    ).toBe(3);
+    expect(
+      await redis.mget(
+        seatLockKey('E1', 42),
+        seatLockKey('E1', 43),
+        seatLockKey('E1', 44)
+      )
+    ).toEqual([null, null, null]);
+    expect(publish).toHaveBeenCalledTimes(3);
+  });
+
+  it('makes repeated group confirmation idempotent', async () => {
+    const reservation = await request(app)
+      .post('/api/bookings/reserve')
+      .set('Authorization', auth('group-owner'))
+      .send({ event_id: 'E1', seat_numbers: [42, 43, 44] });
+    const payload = {
+      reservation_id: reservation.body.reservation.id,
+      hold_token: reservation.body.hold_token,
+    };
+
+    const first = await request(app)
+      .post('/api/bookings/confirm')
+      .set('Authorization', auth('group-owner'))
+      .send(payload);
+    const second = await request(app)
+      .post('/api/bookings/confirm')
+      .set('Authorization', auth('group-owner'))
+      .send(payload);
+
+    expect(first.status).toBe(200);
+    expect(second.status).toBe(200);
+    expect(second.body.message).toBe('already confirmed');
+    expect(second.body.bookings).toHaveLength(3);
+    expect(publish).toHaveBeenCalledTimes(3);
   });
 
   it('rejects a new hold for an already-confirmed seat', async () => {

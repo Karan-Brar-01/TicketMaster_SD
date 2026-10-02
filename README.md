@@ -65,7 +65,7 @@ The booking service reads an event's capacity, theatre layout, row restrictions,
 
 Two users can select the same seat at almost the same instant. A normal read-then-write flow allows both requests to observe that the seat is free and can create two successful bookings. This system closes that race at three layers:
 
-1. **Redis contention control:** `SET seat:{event}:{seat} token NX EX 600` permits one temporary holder.
+1. **Redis contention control:** one-seat holds use the same Lua path as grouped holds; the script checks every `seat:{event}:{seat}` key and creates all requested locks with one ownership token and TTL only when every key is free.
 2. **PostgreSQL transaction:** confirmation locks the relevant booking rows with `SELECT ... FOR UPDATE` before changing `held` to `confirmed`.
 3. **Database invariant:** a partial unique index permits historical held, expired, and cancelled rows, but guarantees at most one confirmed booking for an event seat.
 
@@ -80,23 +80,23 @@ Redis handles temporary contention, the transaction handles confirmation concurr
 ## Booking flow
 
 ```text
-User selects seat 42
+User selects seat 42 (or seats 42, 43, and 44)
         │
         ▼
 POST /api/bookings/reserve
         │
-        ├─ reject an existing confirmed booking
-        ├─ acquire Redis hold with a unique token and TTL
-        └─ create a HELD booking row
+        ├─ validate capacity, blocked rows, pricing, and confirmed seats
+        ├─ atomically acquire every Redis hold with one Lua script
+        └─ create every HELD booking row in one PostgreSQL transaction
         │
         ▼
 POST /api/bookings/confirm
         │
-        ├─ validate user and hold token
-        ├─ lock matching rows in a PostgreSQL transaction
-        ├─ transition HELD → CONFIRMED
-        ├─ release the Redis hold with compare-and-delete Lua
-        └─ publish booking.confirmed
+        ├─ validate user and ownership of every hold key
+        ├─ lock all matching rows in one PostgreSQL transaction
+        ├─ transition the complete group HELD → CONFIRMED
+        ├─ release only Redis locks still owned by the request token
+        └─ publish one booking.confirmed event per seat
         │
         ▼
 RabbitMQ → notification worker → simulated ticket and email
@@ -104,10 +104,97 @@ RabbitMQ → notification worker → simulated ticket and email
 
 Confirmation is idempotent for the owner: a repeated request returns the existing confirmed booking without publishing a second event.
 
+## Atomic multi-seat API
+
+The reserve endpoint remains backwards compatible. Existing clients can continue sending `seat_number`; grouped reservations send `seat_numbers`:
+
+```json
+{
+  "event_id": "event-id",
+  "seat_numbers": [42, 43, 44]
+}
+```
+
+A successful grouped response contains one reservation ID, one private hold token shared by the group, the durable booking row for each seat, and backend-calculated seat metadata and pricing:
+
+```json
+{
+  "reservation": {
+    "id": "reservation-uuid",
+    "event_id": "event-id",
+    "status": "held",
+    "booking_ids": ["booking-1", "booking-2", "booking-3"],
+    "seat_numbers": [42, 43, 44],
+    "seats": [
+      { "seat_number": 42, "seat_type": "standard", "price": 500, "currency": "INR" }
+    ],
+    "total_price": 1500,
+    "currency": "INR"
+  },
+  "hold_token": "private-ownership-token",
+  "hold_ttl_seconds": 600
+}
+```
+
+Confirm the group together:
+
+```json
+{
+  "reservation_id": "reservation-uuid",
+  "hold_token": "private-ownership-token"
+}
+```
+
+The legacy confirmation body, `{ "booking_id": "...", "hold_token": "..." }`, remains valid. If that booking belongs to a group, the complete group is confirmed. A repeated confirmation returns `already confirmed` and does not republish notifications.
+
+### Why acquisition is all-or-nothing
+
+The Redis Lua script receives every seat key in `KEYS`. Redis executes the script atomically: it first checks the complete key set, returns failure without writing if any key exists, and only then writes every key with the same token and expiry. Concurrent groups that overlap on even one seat therefore cannot both succeed, and the losing group acquires none of its other seats.
+
+After Redis succeeds, Prisma expires abandoned historical hold rows and inserts every new `held` row inside one PostgreSQL transaction. A failed insert rolls the entire database transaction back. The booking service then runs a multi-key compare-and-delete Lua script; it removes only keys whose value still equals this request's ownership token, so it cannot delete a lock acquired later by another request.
+
+Redis and PostgreSQL are still separate systems, so this is a compensated workflow rather than a distributed transaction. A process crash after Redis acquisition but before database commit/compensation can leave temporary locks until their TTL expires. PostgreSQL's partial unique index remains the durable final guard against more than one confirmed booking per event seat.
+
+### Manual curl test
+
+Start the stack and get a JWT using the seeded demo account:
+
+```bash
+curl -s http://localhost/api/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"email":"user@demo.com","password":"user123"}'
+```
+
+Copy the returned `token`, choose an event ID from `GET /api/events`, then reserve a group:
+
+```bash
+curl -i http://localhost/api/bookings/reserve \
+  -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer <jwt>' \
+  -d '{"event_id":"<event-id>","seat_numbers":[42,43,44]}'
+```
+
+Copy `reservation.id` and `hold_token` from the `201` response and confirm all seats together:
+
+```bash
+curl -i http://localhost/api/bookings/confirm \
+  -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer <jwt>' \
+  -d '{"reservation_id":"<reservation-id>","hold_token":"<hold-token>"}'
+```
+
+Send the same confirmation again to verify the idempotent `already confirmed` response. To observe contention, send two reserve requests concurrently with overlapping groups such as `[42,43,44]` and `[44,45,46]`; exactly one returns `201` and the other returns `409` without holding its non-overlapping seats.
+
 ## Concurrency tests
 
 The booking integration suite uses real PostgreSQL and Redis. It covers:
 
+- Atomic three-seat reservation and backend-owned group pricing
+- Duplicate, blocked, out-of-range, already-confirmed, and already-held group rejection
+- No partial Redis locks or PostgreSQL rows after a failed group reservation
+- Overlapping concurrent groups with exactly one winner
+- Database rollback plus ownership-safe Redis compensation
+- Atomic group confirmation and repeated-confirmation idempotency
 - 20 users racing for one seat: one hold succeeds and 19 conflict
 - Backend rejection of every seat in the configured closed theatre row
 - Backend-provided row labels, VIP tiers, and INR prices
@@ -193,5 +280,6 @@ GitHub Actions builds the frontend and all four services on every push and pull 
 - Payment and email/PDF delivery are simulations.
 - Authentication uses a shared JWT secret rather than a dedicated identity platform.
 - The database commit and RabbitMQ publish are separate operations, leaving a dual-write failure window. A production version should use a **transactional outbox**, committing the booking and outbox event atomically before a worker publishes it.
+- Redis acquisition and the PostgreSQL transaction are coordinated with compensation, not a distributed commit. A process crash in that narrow window can leave temporary locks until their TTL expires; it cannot create duplicate confirmed seats because PostgreSQL retains the final uniqueness invariant.
 - Retry and dead-letter queues preserve failed notification events, but there is no operator replay UI.
 - The deployment is intentionally Docker Compose-based; Kubernetes, Kafka, service meshes, and event sourcing are outside this project's scope.
